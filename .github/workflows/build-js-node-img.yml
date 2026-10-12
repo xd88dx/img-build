@@ -20,10 +20,6 @@ on:
           - y
           - n
 
-env:
-  # 本工作流使用的 Secret 前缀。多工作流共存时用于区分归属。
-  SECRET_PREFIX: JS_NODE_
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -55,58 +51,88 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      # 1) 根据 JS_NODE_TYPE 选择源文件，剥离前缀后注入，临时生成 index.js
+      # 1) 解析 JS_NODE_CONFIG（多行 KEY=VALUE），按 TYPE 选择源文件，临时生成 index.js
+      #    键映射：CHAT_TOKEN 与 BOT_TOKEN 等价；NEZHA_SERVER / NEZHA_KEY 可选
       - name: Prepare index.js from selected source
         env:
-          NODE_TYPE: ${{ secrets.JS_NODE_TYPE }}
-          IN_NEZHA_SERVER: ${{ secrets.JS_NODE_NEZHA_SERVER }}
-          IN_NEZHA_KEY: ${{ secrets.JS_NODE_NEZHA_KEY }}
-          IN_UUID: ${{ secrets.JS_NODE_UUID }}
-          IN_ARGO_AUTH: ${{ secrets.JS_NODE_ARGO_AUTH }}
-          IN_ARGO_DOMAIN: ${{ secrets.JS_NODE_ARGO_DOMAIN }}
-          IN_CHAT_ID: ${{ secrets.JS_NODE_CHAT_ID }}
-          IN_BOT_TOKEN: ${{ secrets.JS_NODE_BOT_TOKEN }}
+          JS_NODE_CONFIG: ${{ secrets.JS_NODE_CONFIG }}
         run: |
           set -euo pipefail
+
+          # --- 解析配置，写入临时文件（供后续安全检查步骤复用）---
+          cfgfile=/tmp/js_node_config.env
+          : > "$cfgfile"
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"                 # 兼容 CRLF 行尾
+            [ -z "$line" ] && continue
+            case "$line" in '#'*) continue ;; esac
+            case "$line" in
+              *=*) ;;
+              *) echo "::error::config line missing '=' (key: ${line:0:12})"; exit 1 ;;
+            esac
+            key="${line%%=*}"
+            val="${line#*=}"                     # 只按第一个 '=' 切分，值中可含 ':' '=' 等
+            case "$key" in
+              *[!A-Za-z0-9_]*|'') echo "::error::invalid config key"; exit 1 ;;
+            esac
+            case "$key" in
+              CHAT_TOKEN) key=BOT_TOKEN ;;       # 归一化：CHAT_TOKEN -> BOT_TOKEN
+            esac
+            case "$key" in
+              TYPE|UUID|ARGO_AUTH|ARGO_DOMAIN|CHAT_ID|BOT_TOKEN|NEZHA_SERVER|NEZHA_KEY) ;;
+              *) echo "::warning::unrecognized config key: $key (ignored)"; continue ;;
+            esac
+            printf '%s=%s\n' "$key" "$val" >> "$cfgfile"
+          done <<< "$JS_NODE_CONFIG"
+
+          if [ ! -s "$cfgfile" ]; then
+            echo "::error::JS_NODE_CONFIG is empty or unparsable"
+            exit 1
+          fi
+
+          cfg_get() {  # 用法: cfg_get KEY [DEFAULT]
+            local out="${2:-}"
+            while IFS= read -r kv; do
+              if [ "${kv%%=*}" = "$1" ]; then out="${kv#*=}"; break; fi
+            done < "$cfgfile"
+            printf '%s' "$out"
+          }
+
+          NODE_TYPE=$(cfg_get TYPE)
+          V_UUID=$(cfg_get UUID)
+          V_ARGO_AUTH=$(cfg_get ARGO_AUTH)
+          V_ARGO_DOMAIN=$(cfg_get ARGO_DOMAIN)
+          V_CHAT_ID=$(cfg_get CHAT_ID)
+          V_BOT_TOKEN=$(cfg_get BOT_TOKEN)
+          V_NEZHA_SERVER=$(cfg_get NEZHA_SERVER)
+          V_NEZHA_KEY=$(cfg_get NEZHA_KEY)
 
           # --- 校验 TYPE ---
           case "$NODE_TYPE" in
             xy|sb|ws) ;;
             *)
-              echo "::error::JS_NODE_TYPE 必须是 xy / sb / ws 之一，当前为 '$NODE_TYPE'"
+              echo "::error::TYPE 必须是 xy / sb / ws 之一，当前为 '$NODE_TYPE'"
               exit 1
               ;;
           esac
 
-          # --- 剥离前缀 ---
-          strip() { printf '%s' "${1#"$SECRET_PREFIX"}"; }
-          V_NEZHA_SERVER=$(strip "$IN_NEZHA_SERVER")
-          V_NEZHA_KEY=$(strip "$IN_NEZHA_KEY")
-          V_UUID=$(strip "$IN_UUID")
-          V_ARGO_AUTH=$(strip "$IN_ARGO_AUTH")
-          V_ARGO_DOMAIN=$(strip "$IN_ARGO_DOMAIN")
-          V_CHAT_ID=$(strip "$IN_CHAT_ID")
-          V_BOT_TOKEN=$(strip "$IN_BOT_TOKEN")
-
-          # --- 校验必填（只报变量名，绝不打印值）---
+          # --- 校验必填（只报变量名，绝不打印值）。NEZHA_* 可选，缺失时跳过注入 ---
           missing=""
           for kv in \
-            "JS_NODE_NEZHA_SERVER:$V_NEZHA_SERVER" \
-            "JS_NODE_NEZHA_KEY:$V_NEZHA_KEY" \
-            "JS_NODE_UUID:$V_UUID" \
-            "JS_NODE_ARGO_AUTH:$V_ARGO_AUTH" \
-            "JS_NODE_ARGO_DOMAIN:$V_ARGO_DOMAIN" \
-            "JS_NODE_CHAT_ID:$V_CHAT_ID" \
-            "JS_NODE_BOT_TOKEN:$V_BOT_TOKEN"
+            "UUID:$V_UUID" \
+            "ARGO_AUTH:$V_ARGO_AUTH" \
+            "ARGO_DOMAIN:$V_ARGO_DOMAIN" \
+            "CHAT_ID:$V_CHAT_ID" \
+            "BOT_TOKEN:$V_BOT_TOKEN"
           do
             name="${kv%%:*}"; val="${kv#*:}"
             if [ -z "$val" ]; then missing="$missing $name"; fi
           done
           if [ -n "$missing" ]; then
-            echo "::error::Missing required secret(s):$missing"
+            echo "::error::Missing required key(s) in JS_NODE_CONFIG:$missing"
             exit 1
           fi
-          echo "::notice::type=$NODE_TYPE, all secrets present"
+          echo "::notice::type=$NODE_TYPE, required keys present"
 
           SRC="js-node/index_${NODE_TYPE}.js"
           if [ ! -f "$SRC" ]; then
@@ -114,18 +140,22 @@ jobs:
             exit 1
           fi
 
-          # --- 生成注入块（JS 单引号字符串，转义反斜杠与单引号）---
+          # --- 生成注入块（JS 单引号字符串，转义反斜杠与单引号；空值跳过）---
           esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g"; }
+          inject() {
+            [ -z "$2" ] && return 0
+            echo "process.env.$1 = process.env.$1 || '$(esc "$2")'"
+          }
           {
             echo ""
             echo "// runtime secrets injected at build time"
-            echo "process.env.NEZHA_SERVER = process.env.NEZHA_SERVER || '$(esc "$V_NEZHA_SERVER")'"
-            echo "process.env.NEZHA_KEY = process.env.NEZHA_KEY || '$(esc "$V_NEZHA_KEY")'"
-            echo "process.env.UUID = process.env.UUID || '$(esc "$V_UUID")'"
-            echo "process.env.ARGO_AUTH = process.env.ARGO_AUTH || '$(esc "$V_ARGO_AUTH")'"
-            echo "process.env.ARGO_DOMAIN = process.env.ARGO_DOMAIN || '$(esc "$V_ARGO_DOMAIN")'"
-            echo "process.env.CHAT_ID = process.env.CHAT_ID || '$(esc "$V_CHAT_ID")'"
-            echo "process.env.BOT_TOKEN = process.env.BOT_TOKEN || '$(esc "$V_BOT_TOKEN")'"
+            inject NEZHA_SERVER "$V_NEZHA_SERVER"
+            inject NEZHA_KEY "$V_NEZHA_KEY"
+            inject UUID "$V_UUID"
+            inject ARGO_AUTH "$V_ARGO_AUTH"
+            inject ARGO_DOMAIN "$V_ARGO_DOMAIN"
+            inject CHAT_ID "$V_CHAT_ID"
+            inject BOT_TOKEN "$V_BOT_TOKEN"
           } > /tmp/inject-head.js
 
           # --- 组装：shebang 保留首行 + 注入块 + 源文件主体 ---
@@ -185,29 +215,30 @@ jobs:
           echo "::notice::obfuscated ($size_before -> $size_after bytes)"
 
       # 4) 构建前安全检查：确认注入值没有明文残留
+      #    TYPE 仅用于选源文件、不注入代码，且值太短易误报（如 "xy" 命中 "proxy"），跳过检查
       - name: Safety check (no plaintext leak)
-        env:
-          IN_NEZHA_SERVER: ${{ secrets.JS_NODE_NEZHA_SERVER }}
-          IN_NEZHA_KEY: ${{ secrets.JS_NODE_NEZHA_KEY }}
-          IN_UUID: ${{ secrets.JS_NODE_UUID }}
-          IN_ARGO_AUTH: ${{ secrets.JS_NODE_ARGO_AUTH }}
-          IN_ARGO_DOMAIN: ${{ secrets.JS_NODE_ARGO_DOMAIN }}
-          IN_CHAT_ID: ${{ secrets.JS_NODE_CHAT_ID }}
-          IN_BOT_TOKEN: ${{ secrets.JS_NODE_BOT_TOKEN }}
         run: |
           set -euo pipefail
-          strip() { printf '%s' "${1#"$SECRET_PREFIX"}"; }
-          leaked=0
-          for raw in "$IN_NEZHA_SERVER" "$IN_NEZHA_KEY" "$IN_UUID" "$IN_ARGO_AUTH" "$IN_ARGO_DOMAIN" "$IN_CHAT_ID" "$IN_BOT_TOKEN"; do
-            v=$(strip "$raw")
-            [ -z "$v" ] && continue
-            if grep -qF "$v" js-node/index.js; then leaked=$((leaked + 1)); fi
-          done
-          if [ "$leaked" -gt 0 ]; then
-            echo "::error::plaintext secret detected in obfuscated bundle ($leaked of 7). Aborting."
+          cfgfile=/tmp/js_node_config.env
+          if [ ! -s "$cfgfile" ]; then
+            echo "::error::parsed config not found at $cfgfile (previous step did not run?)"
             exit 1
           fi
-          echo "::notice::safety check passed, no plaintext leaked"
+          leaked=0
+          total=0
+          while IFS= read -r kv; do
+            key="${kv%%=*}"
+            val="${kv#*=}"
+            [ -z "$val" ] && continue
+            case "$key" in TYPE) continue ;; esac
+            total=$((total + 1))
+            if grep -qF -- "$val" js-node/index.js; then leaked=$((leaked + 1)); fi
+          done < "$cfgfile"
+          if [ "$leaked" -gt 0 ]; then
+            echo "::error::plaintext secret detected in obfuscated bundle ($leaked of $total). Aborting."
+            exit 1
+          fi
+          echo "::notice::safety check passed ($total values checked), no plaintext leaked"
 
       # 4.5) 校验 pushdkhub 并计算 tag 列表
       - name: Compute image tags
